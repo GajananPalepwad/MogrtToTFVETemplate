@@ -34,14 +34,16 @@ KNOWN FIDELITY LIMITS (also printed as warnings per file)
 * Track mattes / masks have no equivalent in the reference schema.  A matte-driven
   reveal is approximated by an opacity ramp whose timing is computed from the real
   geometry (how much of the text is inside the matte at each instant).
-* Only: text layers, 2-point stroked lines (+Trim Paths), rect / ellipse /
-  rectangular-path shapes and solids are converted.  Effects other than Fill and
+* Only: text layers, 2-point stroked lines and rectangle outlines (+Trim Paths), rect /
+  ellipse / rectangular-path shapes and solids are converted.  Effects other than Fill and
   Color Control, text animators, 3D, expressions (except colour links) are skipped.
 * Assumptions about the editor (change with flags if it renders differently):
     - position is in px relative to the centre of the 1920x1080 AE comp,
       +y is DOWN, rotation is degrees clockwise-positive;
     - a text clip's position/rotation/scale pivot is the bottom-centre of its box
-      (verticalAnchor "bottom"), box bottom == text baseline  (--descent-ratio);
+      (verticalAnchor "bottom"), and the box bottom is a font-dependent distance below the
+      text baseline (EDITOR_FONTS, --descent-ratio);
+    - text is drawn at text.fontSize with scale 1 (the editor applies a text clip's scale twice);
 * Easing: AE's bezier ease is reproduced by densely sampled linear keyframes
   (adaptive, <=0.2px / <=0.2deg / <=0.15% scale error), so the result does not
   depend on how the editor interprets easeIn/easeOut handles.
@@ -77,6 +79,21 @@ WEIGHTS = {
     "semibold": 600, "demibold": 600, "bold": 700, "extrabold": 800, "ultrabold": 800,
     "black": 900, "heavy": 900,
 }
+
+# Fonts the editor bundles (public/fonts), with what is needed to place text drawn in them:
+#   baseline  how far (em) the editor draws the baseline above the bottom of a text clip's box.
+#             Measured in the Program monitor with flat-bottomed capitals; it differs per font.
+#   weights   the weights the font file really has (None = variable font).  Any other weight is
+#             drawn as synthetic bold, which is wider and taller than the real glyphs.
+EDITOR_FONTS = {
+    "bebas neue": {"baseline": 0.350, "weights": (400,)},
+    "inter": {"baseline": 0.297, "weights": None},
+    "montserrat": {"baseline": 0.307, "weights": None},
+    "playfair display": {"baseline": 0.287, "weights": None},
+    "roboto mono": {"baseline": 0.307, "weights": None},
+    "caveat": {"baseline": 0.257, "weights": None},
+}
+DEFAULT_BASELINE = 0.3  # for a font that has not been measured
 
 
 # --------------------------------------------------------------------------- #
@@ -316,9 +333,26 @@ def split_font(ps: str):
     return fam, weight, italic
 
 
+def _norm(name: str) -> str:
+    """Font names compared without spaces, dashes or case ('Bebas Neue' == 'BebasNeue')."""
+    return re.sub(r"[\s_\-]", "", name or "").lower()
+
+
+def resolve_font(ps: str, font_map: dict[str, str]):
+    """Family, weight and italic the output clip uses for an AE PostScript name: the family goes
+    through --font-map, then the weight snaps to one the editor's font really has."""
+    fam, weight, italic = split_font(ps)
+    fam = font_map.get(_norm(fam)) or font_map.get(_norm(ps)) or fam
+    weights = (EDITOR_FONTS.get(fam.lower()) or {}).get("weights")
+    if weights:
+        weight = min(weights, key=lambda w: abs(w - weight))
+    return fam, weight, italic
+
+
 class TextMeter:
     """Width estimation. Uses real glyph advances if a matching font file is found in
-    --font-dir, otherwise a calibrated heuristic (good enough for bounds + matte maths)."""
+    --font-dir, otherwise a calibrated heuristic (good enough for bounds + matte maths).
+    Files are found by PostScript name or by family name."""
 
     def __init__(self, font_dir: str | None, notes: Notes):
         self.files = {}
@@ -334,22 +368,84 @@ class TextMeter:
                 if p.suffix.lower() in (".ttf", ".otf"):
                     try:
                         f = TTFont(str(p), lazy=True)
-                        ps = f["name"].getDebugName(6)
+                        names = f["name"]
+                        ps = names.getDebugName(6)
                         if ps:
-                            self.files[ps] = p
+                            self.files[_norm(ps)] = p
+                        family = names.getDebugName(16) or names.getDebugName(1)
+                        if family:
+                            regular = _norm(names.getDebugName(17) or names.getDebugName(2)) == "regular"
+                            if regular or _norm(family) not in self.files:
+                                self.files[_norm(family)] = p
                     except Exception:
                         pass
 
-    def width(self, ps, size, text, tracking_px, weight):
-        lines = text.split("\n")
-        return max(self._line(ps, size, ln, tracking_px, weight) for ln in lines) if lines else 0.0
+    def _font(self, names):
+        """Loaded font for the first of `names` (family or PostScript name) that has a file."""
+        for name in names:
+            key = _norm(name)
+            if key not in self.files:
+                continue
+            if key not in self.cache:
+                try:
+                    from fontTools.ttLib import TTFont
+                    self.cache[key] = TTFont(str(self.files[key]))
+                except Exception:
+                    self.cache[key] = None
+            if self.cache[key] is not None:
+                return self.cache[key]
+        return None
 
-    def _line(self, ps, size, line, tracking_px, weight):
-        if ps in self.files:
+    def ink(self, names, size, text):
+        """(top, bottom) of the glyph outlines relative to the baseline in px (top is negative,
+        bottom is positive below it), or None when there is no font file."""
+        f = self._font(names)
+        if f is None:
+            return None
+        try:
+            from fontTools.pens.boundsPen import BoundsPen
+            gs, cmap, upm = f.getGlyphSet(), f.getBestCmap(), f["head"].unitsPerEm
+            lo, hi = [], []
+            for ch in text:
+                if ch.isspace():
+                    continue
+                pen = BoundsPen(gs)
+                gs[cmap.get(ord(ch), ".notdef")].draw(pen)
+                if pen.bounds:
+                    lo.append(pen.bounds[1])
+                    hi.append(pen.bounds[3])
+            return (-max(hi) * size / upm, -min(lo) * size / upm) if hi else None
+        except Exception:
+            return None
+
+    def bearings(self, names, size, line):
+        """(left, right) empty space in px between a line's advance box and its first and last
+        glyph outline, or (0, 0) when there is no font file."""
+        f = self._font(names)
+        line = line.strip()
+        if f is None or not line:
+            return 0.0, 0.0
+        try:
+            from fontTools.pens.boundsPen import BoundsPen
+            gs, cmap, hmtx, upm = f.getGlyphSet(), f.getBestCmap(), f["hmtx"], f["head"].unitsPerEm
+            first, last = (cmap.get(ord(c), ".notdef") for c in (line[0], line[-1]))
+            lb, rb = BoundsPen(gs), BoundsPen(gs)
+            gs[first].draw(lb)
+            gs[last].draw(rb)
+            if not lb.bounds or not rb.bounds:
+                return 0.0, 0.0
+            return lb.bounds[0] * size / upm, (hmtx[last][0] - rb.bounds[2]) * size / upm
+        except Exception:
+            return 0.0, 0.0
+
+    def width(self, names, size, text, tracking_px, weight):
+        lines = text.split("\n")
+        return max(self._line(names, size, ln, tracking_px, weight) for ln in lines) if lines else 0.0
+
+    def _line(self, names, size, line, tracking_px, weight):
+        f = self._font(names)
+        if f is not None:
             try:
-                from fontTools.ttLib import TTFont
-                f = self.cache.get(ps) or TTFont(str(self.files[ps]))
-                self.cache[ps] = f
                 cmap, hmtx, upm = f.getBestCmap(), f["hmtx"], f["head"].unitsPerEm
                 w = sum(hmtx[cmap.get(ord(ch), ".notdef")][0] for ch in line) * size / upm
                 return w + tracking_px * max(len(line) - 1, 0)
@@ -414,6 +510,22 @@ def load_mogrt(path: Path, workdir: Path):
     return definition, comp, wrappers, outer
 
 
+def time_remap_hold(wrappers):
+    """Inner-comp time at which the wrapper layers' Time Remap stops advancing, or None.  That is
+    where the intro really ends (the remap freezes the artwork there, even if a keyframe runs a
+    little later) and where a replay of the intro for the exit starts.  Only a remap that plays at
+    normal speed up to the hold is understood."""
+    for W in wrappers:
+        prop = next((p for p in walk_layer(W) if p.match_name == "ADBE Time Remapping"), None)
+        if prop is None or not getattr(W, "time_remap_enabled", False):
+            continue
+        keys = [(k.time, float(k.value)) for k in prop.keyframes]
+        for (t0, v0), (t1, v1) in zip(keys, keys[1:]):
+            if t0 > 0 and abs(v1 - v0) < 1e-6:
+                return v0 if abs(t0 - v0) < 1e-3 else None
+    return None
+
+
 def _descend_precomp(comp):
     """Many mogrts wrap the real artwork in a nested comp (often 2x larger, scaled down by
     the wrapper layer).  If `comp` has no text / shape layers of its own, follow its first
@@ -462,6 +574,7 @@ class Ctx:
             notes.warn(f"artwork lives in nested comp '{comp.name}' ({comp.width}x{comp.height}) inside "
                        f"'{outer.name}' ({outer.width}x{outer.height}); wrapper layer transform applied")
         self.meter = TextMeter(args.font_dir, notes)
+        self.font_map = getattr(args, "font_map", None) or {}
         self._wm = {}
 
     # --- transforms --------------------------------------------------------
@@ -580,13 +693,22 @@ class Ctx:
                 text = (doc.text or "").replace("\r\n", "\n").replace("\r", "\n").replace("\x03", "\n")
                 if getattr(doc, "all_caps", False):
                     text = text.upper()
-                _, weight, _ = split_font(doc.font)
+                fam, weight, _ = resolve_font(doc.font, self.font_map)
+                names = (fam, doc.font)
                 size = float(doc.font_size)
                 trk = float(doc.tracking or 0) / 1000.0 * size
-                w = self.meter.width(doc.font, size, text, trk, weight) * self.args.text_width_factor
+                # AE measures the glyphs themselves: the rect is the box around their outlines, so the
+                # widest line counts without the empty space before its first and after its last glyph.
+                widest = max(text.split("\n"), key=lambda ln: self.meter.width(names, size, ln, trk, weight))
+                adv = self.meter.width(names, size, widest, trk, weight) * self.args.text_width_factor
+                lsb, rsb = self.meter.bearings(names, size, widest)
+                w = adv - lsb - rsb
                 nl = text.count("\n") + 1
                 lead = float(getattr(doc, "leading", size * 1.2) or size * 1.2)
-                h = size * self.args.text_height_ratio + (nl - 1) * lead
+                # Likewise the height is the ink height of these characters (0.72 em for capitals)
+                # when there is a font file, not a fixed share of the font size.
+                ink = self.meter.ink(names, size, text)
+                h = (ink[1] - ink[0] if ink else size * self.args.text_height_ratio) + (nl - 1) * lead
                 just = int(doc.justification)
                 b_shift = float(getattr(doc, "baseline_shift", 0.0) or 0.0)
                 if getattr(doc, "box_text", False) and getattr(doc, "box_text_pos", None):
@@ -601,8 +723,8 @@ class Ctx:
                         left = bx + (bw - w) / 2.0
                     top = by - b_shift
                 else:
-                    left = {7413: 0.0, 7414: -w}.get(just, -w / 2.0)
-                    top = -size * self.args.text_ascent_ratio - b_shift
+                    left = {7413: lsb, 7414: lsb - adv}.get(just, lsb - adv / 2.0)
+                    top = (ink[0] if ink else -size * self.args.text_ascent_ratio) - b_shift
                 out = {"width": w, "height": h, "left": left, "top": top}
             except Exception as e:
                 self.notes.warn(f"could not measure text layer '{name}' ({type(e).__name__})")
@@ -667,6 +789,27 @@ def resolve_color(ctx: Ctx, L, comp):
     return None, None
 
 
+def vector_group_matrix(gxf, t):
+    """Matrix of a shape group's own transform (its Position, Anchor, Scale and Rotation)."""
+    if gxf is None:
+        return IDENT
+    pp, ap = find(gxf, "ADBE Vector Position"), find(gxf, "ADBE Vector Anchor")
+    pos, anc = pp.value_at_time(t), ap.value_at_time(t)
+    if getattr(pp, "expression_enabled", False) and "anchorPoint" in (getattr(pp, "expression", "") or ""):
+        pos = anc  # position is slaved to the anchor -> no net offset
+    sc = find(gxf, "ADBE Vector Scale").value_at_time(t)
+    rot = find(gxf, "ADBE Vector Rotation").value_at_time(t)
+    return trs(pos, rot, (sc[0] / 100.0, sc[1] / 100.0), anc)
+
+
+def vector_group_rs(gxf, t):
+    """Rotation (degrees) and x / y scale (1 = 100 %) of a shape group's own transform."""
+    if gxf is None:
+        return 0.0, 1.0, 1.0
+    sc = find(gxf, "ADBE Vector Scale").value_at_time(t)
+    return find(gxf, "ADBE Vector Rotation").value_at_time(t), sc[0] / 100.0, sc[1] / 100.0
+
+
 def matte_local_poly(ctx, L, t):
     """Matte outline in the matte layer's own space (a rectangle).  Solids use their
     size; shape layers use the bounding box of their first rect / path / ellipse,
@@ -690,23 +833,32 @@ def matte_local_poly(ctx, L, t):
             x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
         else:
             tag = "Rect" if geom.match_name.endswith("Rect") else "Ellipse"
-            size = find(geom, f"ADBE Vector {tag} Size").value_at_time(t)
-            c = find(geom, f"ADBE Vector {tag} Position").value_at_time(t)
+            size_prop = find(geom, f"ADBE Vector {tag} Size")
+            pos_prop = find(geom, f"ADBE Vector {tag} Position")
+            # An expression-driven rect (sized from a text layer) has a stale stored value.
+            size = resolve_expr_vec(ctx, size_prop, L, f"{tag} Size") or size_prop.value_at_time(t)
+            c = resolve_expr_vec(ctx, pos_prop, L, f"{tag} Position") or pos_prop.value_at_time(t)
             x0, x1 = c[0] - size[0] / 2, c[0] + size[0] / 2
             y0, y1 = c[1] - size[1] / 2, c[1] + size[1] / 2
         pts = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
         gxf = find(grp, "ADBE Vector Transform Group")
-        if gxf is not None:
-            pos = find(gxf, "ADBE Vector Position").value_at_time(t)
-            anc = find(gxf, "ADBE Vector Anchor").value_at_time(t)
-            sc = find(gxf, "ADBE Vector Scale").value_at_time(t)
-            rot = find(gxf, "ADBE Vector Rotation").value_at_time(t)
-            m = trs(pos, rot, (sc[0] / 100.0, sc[1] / 100.0), anc)
-            pts = [mapply(m, *q) for q in pts]
+        m = vector_group_matrix(gxf, t)
+        pts = [mapply(m, *q) for q in pts]
         return pts
     except Exception as e:  # unsupported matte geometry -> ignore the matte
         ctx.notes.warn(f"track matte '{L.name}': geometry not readable ({type(e).__name__}); matte ignored")
         return None
+
+
+def static_uniform_scale(ctx: Ctx, L, D):
+    """Scale of a layer's whole transform chain (wrappers and canvas fit included) if it is the
+    same positive number on both axes at every key time, else None."""
+    times = sorted({t for t in ctx.all_keytimes(L) if 0 <= t <= D} | {0.0, D})
+    scales = [ctx.decomposed(L, t)[1:] for t in times]
+    sx = scales[0][0]
+    if sx > 0 and all(abs(a - sx) < 1e-6 and abs(b - sx) < 1e-6 for a, b in scales):
+        return sx
+    return None
 
 
 def build_text_clip(ctx: Ctx, L, matte_layer, matte_type, D) -> Clip | None:
@@ -726,17 +878,21 @@ def build_text_clip(ctx: Ctx, L, matte_layer, matte_type, D) -> Clip | None:
     text = (doc.text or "").replace("\r\n", "\n").replace("\r", "\n").replace("\x03", "\n")
     if getattr(doc, "all_caps", False):
         text = text.upper()
-    fam, weight, italic = split_font(doc.font)
+    fam, weight, italic = resolve_font(doc.font, ctx.font_map)
+    if fam.lower() not in EDITOR_FONTS:
+        ctx.notes.warn(f"'{L.name}': font '{fam}' is not bundled with the editor, so it is drawn in a "
+                       f"fallback font; pick one with --font-map (e.g. --font-map \"{fam}=Bebas Neue\")")
     size = float(doc.font_size)
     tracking_px = float(doc.tracking or 0) / 1000.0 * size
     just = int(doc.justification)
     align = {7413: "left", 7414: "right"}.get(just, "center")
     nlines = text.count("\n") + 1
     leading = float(getattr(doc, "leading", size * 1.2) or size * 1.2)
-    width = ctx.meter.width(doc.font, size, text, tracking_px, weight)
+    width = ctx.meter.width((fam, doc.font), size, text, tracking_px, weight)
     base_last = (nlines - 1) * leading                              # last baseline (layer y)
     b_shift = float(getattr(doc, "baseline_shift", 0.0) or 0.0)
-    descent = ctx.args.descent_ratio * size
+    baseline = (EDITOR_FONTS.get(fam.lower()) or {}).get("baseline", DEFAULT_BASELINE)
+    descent = (ctx.args.descent_ratio if ctx.args.descent_ratio is not None else baseline) * size
 
     if getattr(doc, "box_text", False) and getattr(doc, "box_text_pos", None):
         bx = float(doc.box_text_pos[0])
@@ -748,7 +904,11 @@ def build_text_clip(ctx: Ctx, L, matte_layer, matte_type, D) -> Clip | None:
             px = bx + width
         else:
             px = bx + width / 2.0
-        py = by + (nlines - 1) * leading + 1.2 * size - b_shift
+        # The first baseline sits one ascent (the glyphs' height above the baseline) below the
+        # box top, the same rule text_rect uses for the top of the rect.
+        ink = ctx.meter.ink((fam, doc.font), size, text)
+        ascent = -ink[0] if ink else ctx.args.text_ascent_ratio * size
+        py = by - b_shift + ascent + (nlines - 1) * leading + descent
         x0 = bx if align == "left" else (bx + (bw - width) / 2.0 if align == "center" else bx + bw - width)
         x1 = x0 + width
         y0 = by - b_shift
@@ -765,6 +925,15 @@ def build_text_clip(ctx: Ctx, L, matte_layer, matte_type, D) -> Clip | None:
     if color is None:
         fc = list(doc.fill_color) + [1.0]
         color = rv(fc[:3] + [1.0], 6)
+    # The editor draws text at text.fontSize x the clip's scale and then applies that scale to the
+    # picture again, so a text clip's size goes in text.fontSize and its scale stays at 1.  Only a
+    # scale that never changes can be folded in; an animated one is kept (and drawn too small).
+    fold = static_uniform_scale(ctx, L, D)
+    if fold is None and any(abs(v - 1.0) > 1e-6 for t in (0.0, D) for v in ctx.decomposed(L, t)[1:]):
+        ctx.notes.warn(f"'{L.name}': animated or non-uniform scale on text cannot be folded into the "
+                       f"font size; the editor applies it twice, so the text is drawn too small")
+    k = fold or 1.0
+    size, tracking_px = size * k, tracking_px * k
     clip = Clip("text", L)
     clip.size, clip.family = size, fam
     clip.default_color = color
@@ -793,6 +962,13 @@ def build_text_clip(ctx: Ctx, L, matte_layer, matte_type, D) -> Clip | None:
         m = ctx_.world(L, t)
         return [mapply(m, *p) for p in rect]
 
+    # A matte hides glyphs, not the empty room under the baseline that the editor's box includes,
+    # so how much of the text it covers is judged on the glyphs' own rect.
+    tr = ctx.text_rect(L.name)
+    ink_rect = ([(tr["left"], tr["top"]), (tr["left"] + tr["width"], tr["top"]),
+                 (tr["left"] + tr["width"], tr["top"] + tr["height"]), (tr["left"], tr["top"] + tr["height"])]
+                if tr else rect)
+
     def frac(t):
         if matte_layer is None:
             return 1.0
@@ -801,7 +977,8 @@ def build_text_clip(ctx: Ctx, L, matte_layer, matte_type, D) -> Clip | None:
             return 1.0
         mm = ctx_.world(matte_layer, t)
         mp = [mapply(mm, *p) for p in local]
-        sub = world_rect(t)
+        m = ctx_.world(L, t)
+        sub = [mapply(m, *p) for p in ink_rect]
         a = abs(poly_area(sub))
         if a < 1e-9:
             return 1.0
@@ -814,7 +991,8 @@ def build_text_clip(ctx: Ctx, L, matte_layer, matte_type, D) -> Clip | None:
         rot, sx, sy = ctx_.decomposed(L, t)
         op = ctx_.tvals(L, t)[4] / 100.0
         vis = 1.0 if (L.in_point - 1e-9 <= t <= L.out_point + 1e-9) else 0.0
-        return {"pos": [x, y], "rot": rot, "scale": [sx, sy], "opacity": op * vis * (frac(t) if vis else 0.0)}
+        return {"pos": [x, y], "rot": rot, "scale": [1.0, 1.0] if fold else [sx, sy],
+                "opacity": op * vis * (frac(t) if vis else 0.0)}
 
     clip.state = state
     clip.box_fn = lambda t: [ctx_.to_center(*p) for p in world_rect(t)]
@@ -828,11 +1006,29 @@ def build_text_clip(ctx: Ctx, L, matte_layer, matte_type, D) -> Clip | None:
 _SAFE = re.compile(r"^[\w\s\.\+\-\*/\(\),\[\]]*$")
 
 
-def eval_rect_expr(expr, rect):
+class _Vec(tuple):
+    """An After Effects array that supports  size/2  in the expressions we evaluate."""
+
+    def __truediv__(self, k):
+        return _Vec(v / k for v in self)
+
+    def __mul__(self, k):
+        return _Vec(v * k for v in self)
+
+
+_OWN_SIZE = re.compile(r'content\("[^"]*"\)(?:\.content\("[^"]*"\))*\.size\b')
+
+
+def eval_rect_expr(expr, rect, own=None, scalar=False):
     """Evaluate the common 'size/position from a text layer's sourceRectAtTime()' expression
-    pattern  (w = s.sourceRectAtTime().width; ...; [w+200, h+10]).  Returns [x, y] or None."""
+    pattern  (w = s.sourceRectAtTime().width; ...; [w+200, h+10]).  Returns [x, y] or None
+    (a number instead when `scalar`).  `own` is the [w, h] of the rect path the expression sits on,
+    for expressions that read  content("Rectangle 1").content("Rectangle Path 1").size."""
     src = re.sub(r"\w+\.sourceRectAtTime\([^)]*\)\.(width|height|top|left)", lambda m: "R_" + m.group(1), expr)
     env = {"R_" + k: float(v) for k, v in rect.items()}
+    if own is not None:
+        env["OWN"] = _Vec(float(v) for v in own)
+        src = _OWN_SIZE.sub("OWN", src)
     result = None
     for ln in (x.strip() for x in re.split(r"[;\r\n]+", src)):
         if not ln:
@@ -854,23 +1050,27 @@ def eval_rect_expr(expr, rect):
             env[m.group(1)] = val
         else:
             result = val
+    if scalar:
+        return float(result) if isinstance(result, (int, float)) else None
     if isinstance(result, (list, tuple)) and len(result) >= 2:
         return [float(result[0]), float(result[1])]
     return None
 
 
-def resolve_expr_vec(ctx, prop, L, what):
-    """Value of an expression-driven 2-D property, or None if not an understood expression."""
+def resolve_expr_vec(ctx, prop, L, what, own=None, scalar=False):
+    """Value of an expression-driven property (2-D, or a number when `scalar`), or None if not an
+    understood expression.  `own` is the size of the rect path the expression reads from itself."""
     if prop is None or not getattr(prop, "expression_enabled", False):
         return None
     expr = getattr(prop, "expression", "") or ""
     m = re.search(r'layer\("([^"]+)"\)', expr)
-    rect = ctx.text_rect(m.group(1)) if m else None
-    val = eval_rect_expr(expr, rect) if rect else None
+    rect = ctx.text_rect(m.group(1)) if m else ({} if own is not None else None)
+    val = eval_rect_expr(expr, rect, own, scalar) if rect is not None else None
     if val is None:
         ctx.notes.warn(f"'{L.name}': expression on {what} not understood; using its (possibly stale) stored value")
         return None
-    ctx.notes.warn(f"'{L.name}': {what} evaluated from text '{m.group(1)}' bounds (estimate; tune --text-width-factor / --font-dir)")
+    if m:
+        ctx.notes.warn(f"'{L.name}': {what} evaluated from text '{m.group(1)}' bounds (estimate; tune --text-width-factor / --font-dir)")
     return val
 
 
@@ -898,7 +1098,7 @@ def build_shape_clip(ctx: Ctx, L) -> Clip | None:
         ctx.notes.warn(f"shape layer '{L.name}': no supported geometry")
         return None
     if geom.match_name in ("ADBE Vector Shape - Rect", "ADBE Vector Shape - Ellipse") and stroke is not None and fill is None:
-        ctx.notes.warn(f"'{L.name}': stroke-only outline (rect/ellipse with Trim Paths) is not representable; skipped")
+        ctx.notes.warn(f"'{L.name}': stroke-only outline (rect/ellipse) is not representable; skipped")
         return None
     if len(list(p for p in contents.properties if p.match_name.startswith("ADBE Vector Shape"))) > 1:
         ctx.notes.warn(f"shape layer '{L.name}': only the first shape in the group is converted")
@@ -968,21 +1168,10 @@ def build_shape_clip(ctx: Ctx, L) -> Clip | None:
     ctx_ = ctx
 
     def group_matrix(t):
-        if gxf is None:
-            return IDENT
-        pp, ap = find(gxf, "ADBE Vector Position"), find(gxf, "ADBE Vector Anchor")
-        pos, anc = pp.value_at_time(t), ap.value_at_time(t)
-        if getattr(pp, "expression_enabled", False) and "anchorPoint" in (getattr(pp, "expression", "") or ""):
-            pos = anc  # position is slaved to the anchor -> no net offset
-        sc = find(gxf, "ADBE Vector Scale").value_at_time(t)
-        rot = find(gxf, "ADBE Vector Rotation").value_at_time(t)
-        return trs(pos, rot, (sc[0] / 100.0, sc[1] / 100.0), anc)
+        return vector_group_matrix(gxf, t)
 
     def group_rs(t):
-        if gxf is None:
-            return 0.0, 1.0, 1.0
-        sc = find(gxf, "ADBE Vector Scale").value_at_time(t)
-        return find(gxf, "ADBE Vector Rotation").value_at_time(t), sc[0] / 100.0, sc[1] / 100.0
+        return vector_group_rs(gxf, t)
 
     def trim_range(t):
         s, e, off = 0.0, 1.0, 0.0  # visible fraction of the path, 0..1
@@ -1043,6 +1232,117 @@ def build_shape_clip(ctx: Ctx, L) -> Clip | None:
     clip.breakpoints = bp
     clip.aspect = length / max(thickness, 1e-6)
     return clip
+
+
+def build_outline_clips(ctx: Ctx, L, D) -> list[Clip] | None:
+    """A rectangle outline (a stroke and no fill) revealed by Trim Paths, like the white line that
+    runs round a title.  The schema has no stroked path, so each side of the rectangle that the
+    line ever visits becomes a thin rect clip, drawn as the part of that side inside the trimmed
+    range.  Returns None if the layer is not such an outline, [] if it is one we cannot convert."""
+    root = find(L, "ADBE Root Vectors Group")
+    grp = next((p for p in root.properties if p.match_name == "ADBE Vector Group"), None) if root is not None else None
+    contents = find(grp, "ADBE Vectors Group")
+    gxf = find(grp, "ADBE Vector Transform Group")
+    rect = next((p for p in contents.properties if p.match_name == "ADBE Vector Shape - Rect"), None) if contents is not None else None
+    stroke = find(contents, "ADBE Vector Graphic - Stroke")
+    trims = [p for p in walk(root) if p.match_name == "ADBE Vector Filter - Trim"] if root is not None else []
+    if rect is None or stroke is None or find(contents, "ADBE Vector Graphic - Fill") is not None or not trims:
+        return None
+    # The start corner and direction below were checked against the preview for the default path
+    # direction (2); another direction or several trims would need the same check.
+    if len(trims) > 1 or int(find(rect, "ADBE Vector Shape Direction").value) != 2:
+        ctx.notes.warn(f"'{L.name}': rectangle outline with several Trim Paths or a reversed path is not converted")
+        return []
+    if float(find(rect, "ADBE Vector Rect Roundness").value) > 0:
+        ctx.notes.warn(f"'{L.name}': rounded corners of the outline are drawn square")
+
+    size_prop, pos_prop = find(rect, "ADBE Vector Rect Size"), find(rect, "ADBE Vector Rect Position")
+    size = resolve_expr_vec(ctx, size_prop, L, "Rect Size") or list(size_prop.value)
+    centre = resolve_expr_vec(ctx, pos_prop, L, "Rect Position", own=size) or list(pos_prop.value)
+    width, height = float(size[0]), float(size[1])
+    cx, cy = float(centre[0]), float(centre[1])
+    offset_prop = find(trims[0], "ADBE Vector Trim Offset")
+    offset_deg = resolve_expr_vec(ctx, offset_prop, L, "Trim Offset", own=size, scalar=True)
+    if offset_deg is None:
+        offset_deg = float(offset_prop.value)
+    perim = 2.0 * (width + height)
+    offset = (offset_deg / 360.0 * perim) % perim
+    thickness = float(find(stroke, "ADBE Vector Stroke Width").value)
+    color = rv(find(stroke, "ADBE Vector Stroke Color").value, 6)
+
+    # The path starts at the top-right corner and runs clockwise (checked against the preview).
+    hx, hy = width / 2.0, height / 2.0
+    tr, br, bl, tl = (cx + hx, cy - hy), (cx + hx, cy + hy), (cx - hx, cy + hy), (cx - hx, cy - hy)
+    sides = [("right", tr, br), ("bottom", br, bl), ("left", bl, tl), ("top", tl, tr)]
+    starts, lengths, run = [], [], 0.0
+    for _, a, b in sides:
+        starts.append(run)
+        lengths.append(math.hypot(b[0] - a[0], b[1] - a[1]))
+        run += lengths[-1]
+
+    def drawn(t):
+        """Range of the path (px from its start) that the trim leaves visible at t."""
+        ts = find(trims[0], "ADBE Vector Trim Start").value_at_time(t)
+        te = find(trims[0], "ADBE Vector Trim End").value_at_time(t)
+        return offset + min(ts, te) / 100.0 * perim, offset + max(ts, te) / 100.0 * perim
+
+    def piece(i, t):
+        """Part of side i that is drawn at t, as (start, end) px along it.  Outside the range it is
+        a zero-length piece at the end the line has not reached yet or has already left, so it
+        moves continuously."""
+        s0 = starts[i] if starts[i] + lengths[i] > offset else starts[i] + perim  # first copy the range reaches
+        lo, hi = drawn(t)
+        return min(max(lo - s0, 0.0), lengths[i]), min(max(hi - s0, 0.0), lengths[i])
+
+    t_end = min(D, L.out_point)
+    steps = max(int((t_end - L.in_point) / 0.02), 0)
+    times = sorted({L.in_point, t_end} | {L.in_point + j * 0.02 for j in range(steps + 1)}
+                   | {k for k in key_times(L) if L.in_point <= k <= t_end})
+    clips = []
+    for i, (name, a, b) in enumerate(sides):
+        n = lengths[i]
+        if n <= 0 or not any(piece(i, t)[1] - piece(i, t)[0] > 1e-6 for t in times):
+            continue
+        ux, uy = (b[0] - a[0]) / n, (b[1] - a[1]) / n          # along the side, in the group's space
+        horizontal = abs(ux) > abs(uy)
+        clip = Clip("shape", L)
+        clip.role = f"outline_{name}"
+        clip.default_color = color
+        clip.source = {
+            "type": "shape", "shapeType": "rect",
+            "width": r(n if horizontal else thickness, 3), "height": r(thickness if horizontal else n, 3),
+            "cornerRadius": 0,
+            "fillColor": {"r": color[0], "g": color[1], "b": color[2], "a": color[3] if len(color) > 3 else 1.0},
+            "strokeWidth": 0,
+        }
+        clip.size = None
+        clip.aspect = 1.0   # not a divider rule, whatever its proportions
+
+        def state(t, i=i, a=a, ux=ux, uy=uy, n=n, horizontal=horizontal):
+            p0, p1 = piece(i, t)
+            mid = (p0 + p1) / 2.0
+            m = mmul(ctx.world(L, t), vector_group_matrix(gxf, t))
+            x, y = ctx.to_center(*mapply(m, a[0] + ux * mid, a[1] + uy * mid))
+            grot, gsx, gsy = vector_group_rs(gxf, t)
+            rot, sx, sy = ctx.decomposed(L, t, extra_rot=grot, extra_scale=(gsx, gsy))
+            frac = max((p1 - p0) / n, ctx.args.min_scale)
+            scale = [sx * frac, sy] if horizontal else [sx, sy * frac]
+            vis = 1.0 if (L.in_point - 1e-9 <= t <= L.out_point + 1e-9) else 0.0
+            op = ctx.tvals(L, t)[4] / 100.0
+            return {"pos": [x, y], "rot": rot, "scale": scale, "opacity": op * vis * (1.0 if p1 - p0 > 1e-6 else 0.0)}
+
+        def box(t, i=i, a=a, ux=ux, uy=uy):
+            p0, p1 = piece(i, t)
+            m = mmul(ctx.world(L, t), vector_group_matrix(gxf, t))
+            half = thickness / 2.0
+            pts = [(a[0] + ux * s - uy * d, a[1] + uy * s + ux * d) for s, d in ((p0, -half), (p1, -half), (p1, half), (p0, half))]
+            return [ctx.to_center(*mapply(m, *q)) for q in pts]
+
+        clip.state = state
+        clip.box_fn = box
+        clip.breakpoints = ctx.all_keytimes(L) + [L.in_point, max(L.in_point - 1e-6, 0.0)]
+        clips.append(clip)
+    return clips
 
 
 def build_solid_clip(ctx: Ctx, L) -> Clip | None:
@@ -1193,6 +1493,10 @@ def convert(path: Path, args) -> tuple[dict, list[str]]:
             elif kind == "ShapeLayer":
                 if id(L) in matte_for:
                     notes.warn(f"'{L.name}': matte on a shape layer ignored")
+                outline = build_outline_clips(ctx, L, D)
+                if outline is not None:
+                    clips.extend(outline)
+                    continue
                 c = build_shape_clip(ctx, L)
             elif kind == "AVLayer" and getattr(L.source, "main_source", None) is not None and type(L.source.main_source).__name__ == "SolidSource":
                 c = build_solid_clip(ctx, L)
@@ -1230,10 +1534,12 @@ def convert(path: Path, args) -> tuple[dict, list[str]]:
                 c.role = "eyebrow" if i == 0 else f"eyebrow{i + 1}"
             for i, c in enumerate(below):
                 c.role = "subtitle" if i == 0 else f"subtitle{i + 1}"
-        for i, c in enumerate(shapes):
+        for i, c in enumerate(c for c in shapes if c.role is None):   # outline sides have their role already
             c.role = "divider" if (getattr(c, "aspect", 1) >= 10 and sum(1 for s in shapes if s.aspect >= 10) == 1) else (
                 "divider" if getattr(c, "aspect", 1) >= 10 and i == 0 else f"shape{i + 1}")
-        role_name = {"title": "Main Title Text", "eyebrow": "Eyebrow Text", "subtitle": "Subtitle Text", "divider": "Divider Line"}
+        role_name = {"title": "Main Title Text", "eyebrow": "Eyebrow Text", "subtitle": "Subtitle Text", "divider": "Divider Line",
+                     "outline_top": "Outline Top", "outline_right": "Outline Right",
+                     "outline_bottom": "Outline Bottom", "outline_left": "Outline Left"}
         ordered = shapes + sorted(texts, key=lambda c: c.state(D)["pos"][1] if c.role != "title" else 0)
         order_key = {"eyebrow": 0, "title": 1, "subtitle": 2}
         ordered = shapes + sorted(texts, key=lambda c: (order_key.get(re.sub(r"\d+$", "", c.role), 3), c.role))
@@ -1252,6 +1558,9 @@ def convert(path: Path, args) -> tuple[dict, list[str]]:
         for c in clips:
             for name, key, tolkey, dim in CHANNELS:
                 intro_end = max(intro_end, last_change_time(baked[id(c)][name], tolkey))
+        held = time_remap_hold(wrappers)
+        if held is not None:
+            intro_end = held
         outro = float(args.outro or 0.0)
         if outro > 0 and (intro_end <= 0 or intro_end + outro > D):
             notes.warn("outro skipped: it would not fit after the intro within the duration (raise --duration)")
@@ -1489,7 +1798,10 @@ def main(argv=None):
     ap.add_argument("--author", default="TheFreeVideoEditor")
     ap.add_argument("--duration", type=float, help="template length in seconds (default: AE comp length)")
     ap.add_argument("--outro", type=float, default=0.0, help="seconds of mirrored-intro outro appended at the end (0 = none, exact to source)")
-    ap.add_argument("--descent-ratio", type=float, default=0.3, help="text box bottom = baseline + ratio*fontSize")
+    ap.add_argument("--descent-ratio", type=float, default=None,
+                    help="text box bottom = baseline + ratio*fontSize (default: measured per editor font, else 0.3)")
+    ap.add_argument("--font-map", action="append", default=[], metavar="FROM=TO",
+                    help="draw an After Effects font in an editor font, e.g. \"AcuminPro=Bebas Neue\" (repeatable)")
     ap.add_argument("--min-scale", type=float, default=0.001, help="smallest scale used when a trimmed line has zero length")
     ap.add_argument("--hide-empty-trim", action="store_true", help="also drive opacity to 0 while a trimmed line has zero length")
     ap.add_argument("--flip-rotation", action="store_true", help="negate rotation if the editor is counter-clockwise-positive")
@@ -1507,6 +1819,13 @@ def main(argv=None):
     ap.add_argument("--text-height-ratio", type=float, default=1.0, help="sourceRect height = ratio * font size")
     ap.add_argument("--text-ascent-ratio", type=float, default=0.72, help="sourceRect top = -ratio * font size")
     args = ap.parse_args(argv)
+    font_map = {}
+    for entry in args.font_map:
+        src, sep, dst = entry.partition("=")
+        if not (sep and src.strip() and dst.strip()):
+            ap.error(f"--font-map expects FROM=TO, got {entry!r}")
+        font_map[_norm(src)] = dst.strip()
+    args.font_map = font_map
 
     files = []
     for i in args.inputs:
